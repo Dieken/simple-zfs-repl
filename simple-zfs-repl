@@ -1,0 +1,133 @@
+#!/bin/dash
+
+set -eu
+
+usage() {
+    echo "$0 v1.0.0 - a simple ZFS replication tool in about 100 lines dash script"
+    echo
+    echo "Usage: $0 [-n] [-r RATE] [-s SSH_URI] [-t SSH_URI] -p PREFIX SOURCE TARGET"
+    echo
+    echo "    SOURCE    pool/filesystem, source ZFS filesystem to replicate from"
+    echo "    TARGET    pool/filesystem, target ZFS filesystem to replicate to"
+    echo
+    echo "  If TARGET exists, then do incremental replication, otherwise do full replication."
+    echo
+    echo "Options:"
+    echo "    -n            dry run except creating snapshot on SOURCE"
+    echo "    -r RATE       bandwidth limit in bytes/s,  a suffix of K, M, G, or T can be added to denote KiB, MiB, GiB, TiB"
+    echo "    -s SSH_URI    [ssh://][user@]host[:port], SSH server URI for SOURCE, local by default"
+    echo "    -t SSH_URI    [ssh://][user@]host[:port], SSH server URI for TARGET, local by default"
+    echo "    -p PREFIX     ZFS snapshot prefix to mark replication position for TARGET"
+    echo
+    echo "Notice PREFIX must be unique for each source and target pair!"
+    echo
+    echo "Examples:"
+    echo "  local without SSH:"
+    echo "    ./simple-zfs-repl -p simple-zfs-repl a/data b/data"
+    echo
+    echo "  remote with SSH:"
+    echo "    ./simple-zfs-repl -p simple-zfs-repl -s localhost -t localhost a/data b/data"
+    echo
+    echo "Dependencies:"
+    echo "  dash flock pv grep ssh zfs"
+
+    exit 1
+}
+
+_zfs() {
+    local cmd=${1:+" ssh -o BatchMode=yes $1"}
+    shift
+
+    echo "[RUN] $cmd zfs" "$@" >&2
+    $cmd zfs "$@"
+}
+
+_pv() {
+    if [ "$PV" ]; then
+        $PV | "$@"
+    else
+        "$@"
+    fi
+}
+
+DRYRUN=
+S=
+T=
+RATE=
+while getopts "np:r:s:t:h" opt; do
+    case "$opt" in
+    n)  DRYRUN=-n ;;
+    p)  PREFIX=${OPTARG}_ ;;
+    r)  RATE="-L ${OPTARG}" ;;
+    s)  S=ssh://${OPTARG#ssh://} ;;
+    t)  T=ssh://${OPTARG#ssh://} ;;
+    *)  usage ;;
+    esac
+done
+shift `expr $OPTIND - 1`
+[ "${2:-}" ] || usage
+
+: ${PREFIX:?"PREFIX must be specified and unique!"}
+SOURCE=${1:?"SOURCE must be specified!"}
+TARGET=${2:?"TARGET must be specified!"}
+SOURCE=${SOURCE%/}; SOURCE=${SOURCE#/}
+TARGET=${TARGET%/}; TARGET=${TARGET#/}
+[ -z "$RATE" -a ! -t 2 ] && PV= || PV="pv $RATE"
+
+[ -w /var/run ] && LOCKDIR=/var/run || LOCKDIR=/var/tmp
+LOCKFILE=$LOCKDIR/simple-zfs-repl_${PREFIX%_}.lock
+exec 4<>$LOCKFILE
+echo "Try to lock $LOCKFILE ..."
+flock -en --verbose -n 4
+
+if _zfs "$T" list -t filesystem "$TARGET" >/dev/null 2>&1; then
+    # incremental replication
+
+    # resume last incremental replication
+    _zfs "$T" get -Hro name,value -t filesystem -s none receive_resume_token "$TARGET" | while read fs token; do
+        [ "$token" = "-" ] || _zfs "$S" send -vt "$token" | _pv _zfs "$T" recv -sv $DRYRUN "$fs"
+    done
+
+    # get last snapshot at target
+    LAST=`_zfs "$T" list -H -o name -S creation -t snapshot "$TARGET" | grep -m 1 "^$TARGET@$PREFIX" || true`
+    if [ -z "$LAST" ]; then
+        echo "No snapshot '@$PREFIX*' found at '$TARGET', can't do incremental replication!" >&2
+        exit 1
+    fi
+
+    LAST=${LAST#"$TARGET@"}
+    if ! _zfs "$S" list -t snapshot "$SOURCE@$LAST" >/dev/null 2>&1; then
+        echo "Last snapshot '$LAST' exists in '$TARGET' but not in '$SOURCE', can't do incremental replication!" >&2
+        exit 1
+    fi
+
+    SNAPSHOT=$PREFIX`date +%Y%m%d_%H%M%S`
+    if [ ! "$LAST" \< "$SNAPSHOT" ]; then
+        echo "Found unstable time, old snapshot '$LAST' should be older than new snapshot '$SNAPSHOT'!" >&2
+        exit 1
+    fi
+
+    # do incremental replication
+    _zfs "$S" snapshot -r "$SOURCE@$SNAPSHOT"
+    _zfs "$S" send -Rwv -I "$SOURCE@$LAST" "$SOURCE@$SNAPSHOT" | _pv _zfs "$T" recv -Fsv $DRYRUN "$TARGET"
+
+    # cleanup old snapshots at source
+    _zfs "$S" list -H -o name -t snapshot "$SOURCE" | grep "^$SOURCE@$PREFIX" | while read name; do
+        [ "$name" = "$SOURCE@$SNAPSHOT" ] || _zfs "$S" destroy -rdv $DRYRUN "$name"
+    done
+
+    # cleanup old snapshots at target
+    _zfs "$T" list -H -o name -t snapshot "$TARGET" | grep "^$TARGET@$PREFIX" | while read name; do
+        [ "$name" = "$TARGET@$SNAPSHOT" ] || _zfs "$T" destroy -rdv $DRYRUN "$name"
+    done
+else
+    # full replication
+    if _zfs "$S" list -H -o name -t snapshot "$SOURCE" | grep -q "^$SOURCE@$PREFIX"; then
+        echo "Found existed snapshots with prefix '${PREFIX%_}', PREFIX must be unique!" >&2
+        exit 1
+    fi
+
+    SNAPSHOT=$PREFIX`date +%Y%m%d_%H%M%S`
+    _zfs "$S" snapshot -r "$SOURCE@$SNAPSHOT"
+    _zfs "$S" send -Rwv "$SOURCE@$SNAPSHOT" | _pv _zfs "$T" recv -sv $DRYRUN "$TARGET"
+fi
