@@ -3,9 +3,9 @@
 set -eu
 
 usage() {
-    echo "$0 v1.0.0 - a simple ZFS replication tool in about 100 lines dash script"
+    echo "$0 v1.1.0 - a simple ZFS replication tool in about 100 lines dash script"
     echo
-    echo "Usage: $0 [-n] [-r RATE] [-s SSH_URI] [-t SSH_URI] -p PREFIX SOURCE TARGET"
+    echo "Usage: $0 [-n] [-x EXCLUDE]... [-r RATE] [-s SSH_URI] [-t SSH_URI] -p PREFIX SOURCE TARGET"
     echo
     echo "    SOURCE    pool/filesystem, source ZFS filesystem to replicate from"
     echo "    TARGET    pool/filesystem, target ZFS filesystem to replicate to"
@@ -14,6 +14,7 @@ usage() {
     echo
     echo "Options:"
     echo "    -n            dry run except creating snapshot on SOURCE"
+    echo "    -x EXCLUDE    pool/filesystem, ZFS filesystem and its descendent to exclude, can be specified multiple times"
     echo "    -r RATE       bandwidth limit in bytes/s,  a suffix of K, M, G, or T can be added to denote KiB, MiB, GiB, TiB"
     echo "    -s SSH_URI    [ssh://][user@]host[:port], SSH server URI for SOURCE, local by default"
     echo "    -t SSH_URI    [ssh://][user@]host[:port], SSH server URI for TARGET, local by default"
@@ -54,9 +55,11 @@ DRYRUN=
 S=
 T=
 RATE=
-while getopts "np:r:s:t:h" opt; do
+EXCLUDES=
+while getopts "nx:p:r:s:t:h" opt; do
     case "$opt" in
     n)  DRYRUN=-n ;;
+    x)  EXCLUDE=${OPTARG#/}; EXCLUDES="$EXCLUDES ${EXCLUDE%/}" ;;
     p)  PREFIX=${OPTARG}_ ;;
     r)  RATE="-L ${OPTARG}" ;;
     s)  S=ssh://${OPTARG#ssh://} ;;
@@ -109,25 +112,37 @@ if _zfs "$T" list -t filesystem "$TARGET" >/dev/null 2>&1; then
 
     # do incremental replication
     _zfs "$S" snapshot -r "$SOURCE@$SNAPSHOT"
-    _zfs "$S" send -Rwv -I "$SOURCE@$LAST" "$SOURCE@$SNAPSHOT" | _pv _zfs "$T" recv -Fsv $DRYRUN "$TARGET"
+    _zfs "$S" list -Hro name -s name -t filesystem "$SOURCE" | while read name; do
+        [ -z "$EXCLUDES" ] || for exclude in $EXCLUDES; do [ "${name#$exclude}" = "$name" ] || { name=; break; } done
+        [ "$name" ] || continue
+        if _zfs "$T" list -t filesystem "$TARGET${name#$SOURCE}" >/dev/null 2>&1; then
+            _zfs "$S" send -pwv -I "$name@$LAST" "$name@$SNAPSHOT" | _pv _zfs "$T" recv -Fsv $DRYRUN "$TARGET${name#$SOURCE}"
+        else
+            _zfs "$S" send -pwv "$name@$SNAPSHOT" | _pv _zfs "$T" recv -sv $DRYRUN "$TARGET${name#$SOURCE}"
+        fi
+    done
 
     # cleanup old snapshots at source
-    _zfs "$S" list -H -o name -t snapshot "$SOURCE" | grep "^$SOURCE@$PREFIX" | while read name; do
+    _zfs "$S" list -Ho name -t snapshot "$SOURCE" | grep "^$SOURCE@$PREFIX" | while read name; do
         [ "$name" = "$SOURCE@$SNAPSHOT" ] || _zfs "$S" destroy -rdv $DRYRUN "$name"
     done
 
     # cleanup old snapshots at target
-    _zfs "$T" list -H -o name -t snapshot "$TARGET" | grep "^$TARGET@$PREFIX" | while read name; do
+    _zfs "$T" list -Ho name -t snapshot "$TARGET" | grep "^$TARGET@$PREFIX" | while read name; do
         [ "$name" = "$TARGET@$SNAPSHOT" ] || _zfs "$T" destroy -rdv $DRYRUN "$name"
     done
 else
     # full replication
-    if _zfs "$S" list -H -o name -t snapshot "$SOURCE" | grep -q "^$SOURCE@$PREFIX"; then
+    if _zfs "$S" list -Ho name -t snapshot "$SOURCE" | grep -q "^$SOURCE@$PREFIX"; then
         echo "Found existed snapshots with prefix '${PREFIX%_}', PREFIX must be unique!" >&2
         exit 1
     fi
 
     SNAPSHOT=$PREFIX`date +%Y%m%d_%H%M%S`
     _zfs "$S" snapshot -r "$SOURCE@$SNAPSHOT"
-    _zfs "$S" send -Rwv "$SOURCE@$SNAPSHOT" | _pv _zfs "$T" recv -sv $DRYRUN "$TARGET"
+    _zfs "$S" list -Hro name -s name -t filesystem "$SOURCE" | while read name; do
+        [ -z "$EXCLUDES" ] || for exclude in $EXCLUDES; do [ "${name#$exclude}" = "$name" ] || { name=; break; } done
+        [ "$name" ] || continue
+        _zfs "$S" send -pwv "$name@$SNAPSHOT" | _pv _zfs "$T" recv -sv $DRYRUN "$TARGET${name#$SOURCE}"
+    done
 fi
