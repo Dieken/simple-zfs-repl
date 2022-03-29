@@ -3,7 +3,7 @@
 set -eu
 
 usage() {
-    echo "$0 v1.1.0 - a simple ZFS replication tool in about 100 lines dash script"
+    echo "$0 v1.2.0 - a simple ZFS replication tool in about 100 lines dash script"
     echo
     echo "Usage: $0 [-n] [-x EXCLUDE]... [-r RATE] [-s SSH_URI] [-t SSH_URI] -p PREFIX SOURCE TARGET"
     echo
@@ -24,10 +24,10 @@ usage() {
     echo
     echo "Examples:"
     echo "  local without SSH:"
-    echo "    ./simple-zfs-repl -p simple-zfs-repl a/data b/data"
+    echo "    $0 -p test a/data b/data"
     echo
     echo "  remote with SSH:"
-    echo "    ./simple-zfs-repl -p simple-zfs-repl -s localhost -t localhost a/data b/data"
+    echo "    $0 -p test -s localhost -t localhost a/data b/data"
     echo
     echo "Dependencies:"
     echo "  dash flock pv grep ssh zfs"
@@ -91,33 +91,39 @@ if _zfs "$T" list -t filesystem "$TARGET" >/dev/null 2>&1; then
         [ "$token" = "-" ] || _zfs "$S" send -vt "$token" | _pv _zfs "$T" recv -sv $DRYRUN "$fs"
     done
 
-    # get last snapshot at target
-    LAST=`_zfs "$T" list -H -o name -S creation -t snapshot "$TARGET" | grep -m 1 "^$TARGET@$PREFIX" || true`
-    if [ -z "$LAST" ]; then
-        echo "No snapshot '@$PREFIX*' found at '$TARGET', can't do incremental replication!" >&2
-        exit 1
-    fi
-
-    LAST=${LAST#"$TARGET@"}
-    if ! _zfs "$S" list -t snapshot "$SOURCE@$LAST" >/dev/null 2>&1; then
-        echo "Last snapshot '$LAST' exists in '$TARGET' but not in '$SOURCE', can't do incremental replication!" >&2
-        exit 1
-    fi
-
-    SNAPSHOT=$PREFIX`date +%Y%m%d_%H%M%S`
-    if [ ! "$LAST" \< "$SNAPSHOT" ]; then
-        echo "Found unstable time, old snapshot '$LAST' should be older than new snapshot '$SNAPSHOT'!" >&2
-        exit 1
-    fi
-
     # do incremental replication
+    SNAPSHOT=$PREFIX`date +%Y%m%d_%H%M%S`
     _zfs "$S" snapshot -r "$SOURCE@$SNAPSHOT"
     _zfs "$S" list -Hro name -s name -t filesystem "$SOURCE" | while read name; do
         [ -z "$EXCLUDES" ] || for exclude in $EXCLUDES; do [ "${name#$exclude}" = "$name" ] || { name=; break; } done
         [ "$name" ] || continue
-        if _zfs "$T" list -t filesystem "$TARGET${name#$SOURCE}" >/dev/null 2>&1; then
-            _zfs "$S" send -pwv -I "$name@$LAST" "$name@$SNAPSHOT" | _pv _zfs "$T" recv -Fsv $DRYRUN "$TARGET${name#$SOURCE}"
+
+        target="$TARGET${name#$SOURCE}"
+
+        if _zfs "$T" list -t filesystem "$target" >/dev/null 2>&1; then
+            # target fs exists
+
+            # get last snapshot at target
+            LAST=`_zfs "$T" list -H -o name -S creation -t snapshot "$target" | grep -m 1 "^$target@$PREFIX" || true`
+            if [ -z "$LAST" ]; then
+                echo "No snapshot '@$PREFIX*' found at '$target', can't do incremental replication!" >&2
+                exit 1
+            fi
+
+            LAST=${LAST#"$target@"}
+            if ! _zfs "$S" list -t snapshot "$SOURCE@$LAST" >/dev/null 2>&1; then
+                echo "Last snapshot '$LAST' exists in '$target' but not in '$SOURCE', can't do incremental replication!" >&2
+                exit 1
+            fi
+
+            if [ ! "$LAST" \< "$SNAPSHOT" ]; then
+                echo "Found unstable time, old snapshot '$LAST' should be older than new snapshot '$SNAPSHOT'!" >&2
+                exit 1
+            fi
+
+            _zfs "$S" send -pwv -I "$name@$LAST" "$name@$SNAPSHOT" | _pv _zfs "$T" recv -Fsv $DRYRUN "$target"
         else
+            # target fs doesn't exist
             _zfs "$S" send -pwv "$name@$SNAPSHOT" | _pv _zfs "$T" recv -sv $DRYRUN "$TARGET${name#$SOURCE}"
         fi
     done
